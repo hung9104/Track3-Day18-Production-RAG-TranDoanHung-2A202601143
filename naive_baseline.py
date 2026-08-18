@@ -7,6 +7,10 @@ Basic = paragraph chunking + dense-only search (không hybrid, không rerank, kh
 
 import sys, os, time
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.m1_chunking import load_documents, chunk_basic
@@ -21,6 +25,13 @@ def main():
     print("(paragraph chunking + dense-only, no rerank, no enrichment)")
     print("=" * 60)
 
+    from config import OPENAI_API_KEY
+    if not OPENAI_API_KEY or OPENAI_API_KEY.strip() == "sk-...":
+        raise RuntimeError(
+            "OPENAI_API_KEY chưa được cấu hình. Hãy thay sk-... trong .env bằng API key thật "
+            "để tạo baseline RAGAS hợp lệ."
+        )
+
     docs = load_documents()
     chunks = []
     for doc in docs:
@@ -34,11 +45,10 @@ def main():
     test_set = load_test_set()
     questions, answers, all_contexts, ground_truths = [], [], [], []
 
-    from config import OPENAI_API_KEY
     llm_client = None
     if OPENAI_API_KEY:
         from openai import OpenAI
-        llm_client = OpenAI()
+        llm_client = OpenAI(timeout=20.0, max_retries=0)
 
     for i, item in enumerate(test_set):
         results = search.search(item["question"], top_k=3, collection=NAIVE_COLLECTION)
@@ -67,7 +77,9 @@ def main():
     print("\nBASIC BASELINE SCORES")
     for m in ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]:
         print(f"  {m}: {results.get(m, 0):.4f}")
-    save_report(results, [], path="naive_baseline_report.json")
+    report_path = os.path.join(os.path.dirname(__file__), "reports", "naive_baseline_report.json")
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    save_report(results, [], path=report_path)
     print("\nDone! Now implement advanced modules and run: python main.py")
 
 

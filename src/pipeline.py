@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import os, sys, time
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.m1_chunking import load_documents, chunk_hierarchical
@@ -14,8 +18,10 @@ from src.m5_enrichment import enrich_chunks
 from config import RERANK_TOP_K
 
 
-def build_pipeline():
-    """Build production RAG pipeline."""
+def build_pipeline(documents: list[dict] | None = None, enable_enrichment: bool = True,
+                   search: HybridSearch | None = None,
+                   reranker: CrossEncoderReranker | None = None):
+    """Build the production pipeline, with injectable components for testing."""
     print("=" * 60)
     print("PRODUCTION RAG PIPELINE")
     print("=" * 60, flush=True)
@@ -23,52 +29,66 @@ def build_pipeline():
     # Step 1: Load & Chunk (M1)
     t0 = time.time()
     print("\n[1/4] Chunking documents...", flush=True)
-    docs = load_documents()
+    docs = documents if documents is not None else load_documents()
     all_chunks = []
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        parent_lookup = {parent.metadata["parent_id"]: parent.text for parent in parents}
         for child in children:
-            all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
+            all_chunks.append({
+                "text": child.text,
+                "metadata": {
+                    **child.metadata,
+                    "parent_id": child.parent_id,
+                    "parent_text": parent_lookup.get(child.parent_id, child.text),
+                },
+            })
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 2: Enrichment (M5)
     t0 = time.time()
-    print(f"\n[2/4] Enriching {len(all_chunks)} chunks (M5, 1 API call/chunk)...", flush=True)
-    enriched = enrich_chunks(all_chunks)
-    if enriched:
-        all_chunks = [{"text": e.enriched_text, "metadata": e.auto_metadata} for e in enriched]
-        print(f"  ✓ Enriched {len(enriched)} chunks ({time.time()-t0:.1f}s)", flush=True)
+    if enable_enrichment:
+        print(f"\n[2/4] Enriching {len(all_chunks)} chunks (M5, 1 API call/chunk)...", flush=True)
+        enriched = enrich_chunks(all_chunks)
+        if enriched:
+            all_chunks = [{"text": e.enriched_text, "metadata": e.auto_metadata} for e in enriched]
+            print(f"  ✓ Enriched {len(enriched)} chunks ({time.time()-t0:.1f}s)", flush=True)
+        else:
+            print("  WARNING: Enrichment returned no chunks; using raw chunks", flush=True)
     else:
-        print("  ⚠️  M5 not implemented — using raw chunks", flush=True)
+        print("\n[2/4] Enrichment disabled; using raw chunks", flush=True)
 
     # Step 3: Index (M2)
     t0 = time.time()
     print(f"\n[3/4] Indexing {len(all_chunks)} chunks (BM25 + Dense)...", flush=True)
-    search = HybridSearch()
+    search = search or HybridSearch()
     search.index(all_chunks)
     print(f"  ✓ Indexed ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 4: Reranker (M3)
     t0 = time.time()
     print("\n[4/4] Loading reranker...", flush=True)
-    reranker = CrossEncoderReranker()
+    reranker = reranker or CrossEncoderReranker()
     print(f"  ✓ Reranker ready ({time.time()-t0:.1f}s)", flush=True)
 
     return search, reranker
 
 
-def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
+def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker,
+              use_llm: bool = True) -> tuple[str, list[str]]:
     """Run single query through pipeline."""
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    contexts = ([r.metadata.get("parent_text", r.text) for r in reranked]
+                if reranked else [r.metadata.get("parent_text", r.text) for r in results[:3]])
+    contexts = list(dict.fromkeys(contexts))
 
     from config import OPENAI_API_KEY
-    if OPENAI_API_KEY and contexts:
+    if use_llm and OPENAI_API_KEY and OPENAI_API_KEY.strip() != "sk-..." and contexts:
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(timeout=20.0, max_retries=0)
             context_str = "\n\n".join(contexts)
             resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
                 {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
@@ -110,7 +130,9 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
         print(f"  {'✓' if s >= 0.75 else '✗'} {m}: {s:.4f}")
 
     failures = failure_analysis(results.get("per_question", []))
-    save_report(results, failures)
+    report_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reports", "ragas_report.json")
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    save_report(results, failures, path=report_path)
     return results
 
 
